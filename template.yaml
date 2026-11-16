@@ -1,0 +1,180 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: SQS-driven data deletion workers with an external PostgreSQL ledger.
+
+Parameters:
+  DatabaseURL:
+    Type: String
+    NoEcho: true
+    Description: Restricted runtime PostgreSQL connection URI; require TLS in production.
+  AuditSalt:
+    Type: String
+    NoEcho: true
+    MinLength: 32
+    Description: Stable secret salt from your secret manager. Do not rotate mid-request.
+  ObjectsBucket:
+    Type: String
+    Description: Existing dedicated unversioned S3 bucket (no Object Lock).
+  AlarmTopicARN:
+    Type: String
+    Description: Existing SNS topic with confirmed on-call/compliance subscriptions.
+  VpcSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Private subnets with PostgreSQL access and AWS service egress.
+  VpcSecurityGroupIds:
+    Type: List<AWS::EC2::SecurityGroup::Id>
+    Description: Lambda security groups permitted to reach PostgreSQL.
+
+Globals:
+  Function:
+    Runtime: provided.al2023
+    Handler: bootstrap
+    Architectures: [x86_64]
+    Timeout: 60
+    MemorySize: 256
+    Environment:
+      Variables:
+        DATABASE_URL: !Ref DatabaseURL
+        AUDIT_SALT: !Ref AuditSalt
+        S3_BUCKET: !Ref ObjectsBucket
+        DB_QUEUE_URL: !Ref DBDeletionQueue
+        S3_QUEUE_URL: !Ref S3DeletionQueue
+    VpcConfig:
+      SubnetIds: !Ref VpcSubnetIds
+      SecurityGroupIds: !Ref VpcSecurityGroupIds
+
+Resources:
+  DBDeletionDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+  S3DeletionDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+  DBDeletionQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 360
+      MessageRetentionPeriod: 86400
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt DBDeletionDLQ.Arn
+        maxReceiveCount: 5
+  S3DeletionQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 360
+      MessageRetentionPeriod: 86400
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt S3DeletionDLQ.Arn
+        maxReceiveCount: 5
+  DBWorker:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: .
+      ReservedConcurrentExecutions: 5
+      Policies:
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt DBDeletionQueue.QueueName
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt S3DeletionQueue.QueueName
+        - Statement:
+            - Effect: Allow
+              Action: s3:GetBucketVersioning
+              Resource: !Sub arn:${AWS::Partition}:s3:::${ObjectsBucket}
+      Events:
+        Messages:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt DBDeletionQueue.Arn
+            BatchSize: 1
+            FunctionResponseTypes: [ReportBatchItemFailures]
+            ScalingConfig:
+              MaximumConcurrency: 2
+        ReplayOutbox:
+          Type: Schedule
+          Properties:
+            Schedule: rate(1 minute)
+            Input: '{"action":"FLUSH_OUTBOX"}'
+  S3Worker:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: .
+      ReservedConcurrentExecutions: 75
+      Policies:
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt DBDeletionQueue.QueueName
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt S3DeletionQueue.QueueName
+        - Statement:
+            - Effect: Allow
+              Action: s3:GetBucketVersioning
+              Resource: !Sub arn:${AWS::Partition}:s3:::${ObjectsBucket}
+            - Effect: Allow
+              Action: s3:DeleteObject
+              Resource: !Sub arn:${AWS::Partition}:s3:::${ObjectsBucket}/*
+      Events:
+        Messages:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt S3DeletionQueue.Arn
+            BatchSize: 1
+            FunctionResponseTypes: [ReportBatchItemFailures]
+            ScalingConfig:
+              MaximumConcurrency: 50
+  DBWorkerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${DBWorker}
+      RetentionInDays: 14
+  S3WorkerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${S3Worker}
+      RetentionInDays: 14
+  DBDeadLetterAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: DB deletion failures require compliance investigation.
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt DBDeletionDLQ.QueueName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopicARN]
+  S3DeadLetterAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: S3 deletion failures require compliance investigation.
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt S3DeletionDLQ.QueueName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopicARN]
+
+Outputs:
+  DBQueueURL:
+    Value: !Ref DBDeletionQueue
+  S3QueueURL:
+    Value: !Ref S3DeletionQueue
