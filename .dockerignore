@@ -1,0 +1,7 @@
+.git
+.github
+.env
+.aws-sam
+bin
+coverage*
+*.out

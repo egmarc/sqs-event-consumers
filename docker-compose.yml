@@ -1,0 +1,74 @@
+name: sqs-event-consumers
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: deletion
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: local-only-owner
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./migrations:/migrations:ro
+      - ./local/postgres-init.sh:/docker-entrypoint-initdb.d/001-init.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d deletion"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  localstack:
+    image: localstack/localstack:4.14.0
+    environment:
+      SERVICES: sqs,s3
+      AWS_DEFAULT_REGION: us-east-1
+      LOCALSTACK_HOST: localstack:4566
+      SQS_ENDPOINT_STRATEGY: path
+    ports:
+      - "127.0.0.1:4566:4566"
+    volumes:
+      - ./local/aws-init.sh:/etc/localstack/init/ready.d/001-init.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /tmp/deletion-ready"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
+
+  db-worker:
+    build:
+      context: .
+      target: local
+    environment: &worker-environment
+      APP_MODE: local
+      DATABASE_URL: "host=postgres port=5432 dbname=deletion user=deletion_worker sslmode=disable"
+      PGPASSWORD: local-only-worker
+      AUDIT_SALT: local-development-only-salt-32-bytes-minimum
+      S3_BUCKET: deletion-objects
+      DB_QUEUE_URL: http://localstack:4566/queue/us-east-1/000000000000/db-deletion-queue
+      S3_QUEUE_URL: http://localstack:4566/queue/us-east-1/000000000000/s3-deletion-queue
+      AWS_ENDPOINT_URL: http://localstack:4566
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+    depends_on:
+      postgres:
+        condition: service_healthy
+      localstack:
+        condition: service_healthy
+    restart: on-failure
+
+  s3-worker:
+    build:
+      context: .
+      target: local
+    entrypoint: ["/app/s3-worker"]
+    environment: *worker-environment
+    depends_on:
+      postgres:
+        condition: service_healthy
+      localstack:
+        condition: service_healthy
+    restart: on-failure
+
+volumes:
+  postgres-data:
