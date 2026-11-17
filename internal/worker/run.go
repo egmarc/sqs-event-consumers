@@ -3,7 +3,7 @@ package worker
 import (
 	"context"
 	"encoding/json"
-	"errors"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
@@ -53,7 +53,7 @@ func (s Service) LambdaHandler(kind string) func(context.Context, json.RawMessag
 		}
 		if event.Action == "FLUSH_OUTBOX" || event.Source == "aws.events" {
 			if err := s.Flush(ctx); err != nil {
-				return events.SQSEventResponse{}, errors.New("outbox replay failed")
+				return events.SQSEventResponse{}, fmt.Errorf("outbox replay failed: %w", err)
 			}
 			return events.SQSEventResponse{}, nil
 		}
@@ -63,7 +63,7 @@ func (s Service) LambdaHandler(kind string) func(context.Context, json.RawMessag
 		response := events.SQSEventResponse{BatchItemFailures: []events.SQSBatchItemFailure{}}
 		for _, record := range event.Records {
 			if err := s.Handle(ctx, kind, []byte(record.Body)); err != nil {
-				log.Print("message processing failed")
+				log.Printf("message %s processing failed: %v", record.MessageId, err)
 				response.BatchItemFailures = append(response.BatchItemFailures, events.SQSBatchItemFailure{ItemIdentifier: record.MessageId})
 			}
 		}
@@ -85,7 +85,7 @@ func local(ctx context.Context, s Service, client *sqs.Client, kind string) {
 		for {
 			flushCtx, cancel := context.WithTimeout(ctx, 25*time.Second)
 			if err := s.Flush(flushCtx); err != nil && ctx.Err() == nil {
-				log.Print("outbox replay failed")
+				log.Printf("outbox replay failed: %v", err)
 			}
 			cancel()
 			select {
@@ -104,7 +104,7 @@ func local(ctx context.Context, s Service, client *sqs.Client, kind string) {
 			if ctx.Err() != nil {
 				return
 			}
-			log.Print("queue receive failed")
+			log.Printf("queue receive failed: %v", err)
 			select {
 			case <-ctx.Done():
 				return
@@ -117,11 +117,11 @@ func local(ctx context.Context, s Service, client *sqs.Client, kind string) {
 			err := s.Handle(workCtx, kind, []byte(aws.ToString(message.Body)))
 			cancel()
 			if err != nil {
-				log.Print("message processing failed")
+				log.Printf("message processing failed: %v", err)
 				continue
 			}
 			if _, err := client.DeleteMessage(ctx, &sqs.DeleteMessageInput{QueueUrl: aws.String(url), ReceiptHandle: message.ReceiptHandle}); err != nil {
-				log.Print("queue acknowledgement failed")
+				log.Printf("queue acknowledgement failed: %v", err)
 			}
 		}
 	}
@@ -130,16 +130,23 @@ func local(ctx context.Context, s Service, client *sqs.Client, kind string) {
 func Run(kind string) {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
-	s := Service{Store: Store{URL: os.Getenv("DATABASE_URL"), Salt: os.Getenv("AUDIT_SALT")},
-		Bucket: os.Getenv("S3_BUCKET"), DBQueue: os.Getenv("DB_QUEUE_URL"), S3Queue: os.Getenv("S3_QUEUE_URL")}
+	databaseURL, salt := os.Getenv("DATABASE_URL"), os.Getenv("AUDIT_SALT")
+	bucket, dbQueue, s3Queue := os.Getenv("S3_BUCKET"), os.Getenv("DB_QUEUE_URL"), os.Getenv("S3_QUEUE_URL")
 	mode := os.Getenv("APP_MODE")
-	if s.Store.URL == "" || len(s.Store.Salt) < 32 || s.Bucket == "" || s.DBQueue == "" || s.S3Queue == "" || (mode != "" && mode != "lambda" && mode != "local") {
+	if databaseURL == "" || len(salt) < 32 || bucket == "" || dbQueue == "" || s3Queue == "" || (mode != "" && mode != "lambda" && mode != "local") {
 		log.Print("invalid application configuration")
 		os.Exit(1)
 	}
+	store, err := NewStore(ctx, databaseURL, salt)
+	if err != nil {
+		log.Printf("database initialization failed: %v", err)
+		os.Exit(1)
+	}
+	defer store.Close()
+	s := Service{Store: store, Bucket: bucket, DBQueue: dbQueue, S3Queue: s3Queue}
 	cfg, err := config.LoadDefaultConfig(ctx)
 	if err != nil {
-		log.Print("AWS configuration failed")
+		log.Printf("AWS configuration failed: %v", err)
 		os.Exit(1)
 	}
 	endpoint := os.Getenv("AWS_ENDPOINT_URL")
@@ -162,7 +169,7 @@ func Run(kind string) {
 	}
 	cancelStartup()
 	if err != nil {
-		log.Print("startup safety check failed")
+		log.Printf("startup safety check failed: %v", err)
 		os.Exit(1)
 	}
 	if mode == "local" {

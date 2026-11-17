@@ -4,34 +4,56 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 type Store struct {
 	URL  string
 	Salt string
+	pool *pgxpool.Pool
 }
 
-func (s Store) transaction(ctx context.Context, fn func(pgx.Tx) error) error {
-	conn, err := pgx.Connect(ctx, s.URL)
+func NewStore(ctx context.Context, url, salt string) (*Store, error) {
+	config, err := pgxpool.ParseConfig(url)
 	if err != nil {
-		return err
+		return nil, fmt.Errorf("parse database configuration: %w", err)
 	}
-	defer conn.Close(ctx)
-	tx, err := conn.Begin(ctx)
+	config.MaxConns = 2
+	pool, err := pgxpool.NewWithConfig(ctx, config)
 	if err != nil {
-		return err
+		return nil, fmt.Errorf("create database pool: %w", err)
 	}
-	defer tx.Rollback(ctx)
+	if err := pool.Ping(ctx); err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("connect to database: %w", err)
+	}
+	return &Store{URL: url, Salt: salt, pool: pool}, nil
+}
+
+func (s *Store) Close() {
+	s.pool.Close()
+}
+
+func (s *Store) transaction(ctx context.Context, fn func(pgx.Tx) error) error {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin database transaction: %w", err)
+	}
+	defer tx.Rollback(context.Background())
 	if err = fn(tx); err != nil {
 		return err
 	}
-	return tx.Commit(ctx)
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit database transaction: %w", err)
+	}
+	return nil
 }
 
 // CheckPrivileges refuses roles capable of bypassing the append-only ledger.
-func (s Store) CheckPrivileges(ctx context.Context) error {
+func (s *Store) CheckPrivileges(ctx context.Context) error {
 	return s.transaction(ctx, func(tx pgx.Tx) error {
 		var unsafe bool
 		err := tx.QueryRow(ctx, `SELECT current_user <> 'deletion_worker'
@@ -70,7 +92,7 @@ func ledger(ctx context.Context, tx pgx.Tx, request, hash, event string, batch a
 	return err
 }
 
-func (s Store) Initiate(ctx context.Context, m Message) error {
+func (s *Store) Initiate(ctx context.Context, m Message) error {
 	if !validUUID(m.RequestID) || m.UserID == "" {
 		return errInvalid
 	}
@@ -144,7 +166,7 @@ func scheduleFinalizer(ctx context.Context, tx pgx.Tx, request, user string) err
 	return enqueue(ctx, tx, "db", Message{Type: "FINALIZE_DB_DELETION", RequestID: request})
 }
 
-func (s Store) Finalize(ctx context.Context, m Message) error {
+func (s *Store) Finalize(ctx context.Context, m Message) error {
 	if !validUUID(m.RequestID) {
 		return errInvalid
 	}

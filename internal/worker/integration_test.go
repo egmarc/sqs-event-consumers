@@ -2,6 +2,7 @@ package worker
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
@@ -69,15 +70,25 @@ func TestIntegration(t *testing.T) {
 	if _, err = admin.Exec(ctx, `CREATE DATABASE `+pgx.Identifier{dbName}.Sanitize()); err != nil {
 		t.Fatal(err)
 	}
-	defer func() {
-		_, err := admin.Exec(context.Background(), `DROP DATABASE `+pgx.Identifier{dbName}.Sanitize()+` WITH (FORCE)`)
-		if err != nil {
-			t.Error(err)
-		}
-	}()
-	if _, err = admin.Exec(ctx, `DO $$ BEGIN IF NOT EXISTS(SELECT 1 FROM pg_roles WHERE rolname='deletion_worker') THEN CREATE ROLE deletion_worker LOGIN PASSWORD 'integration-worker-password'; END IF; END $$`); err != nil {
+	var workerRoleExists bool
+	if err = admin.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_roles WHERE rolname='deletion_worker')`).Scan(&workerRoleExists); err != nil {
 		t.Fatal(err)
 	}
+	if !workerRoleExists {
+		if _, err = admin.Exec(ctx, `CREATE ROLE deletion_worker LOGIN PASSWORD 'integration-worker-password'`); err != nil {
+			t.Fatal(err)
+		}
+	}
+	defer func() {
+		if _, err := admin.Exec(context.Background(), `DROP DATABASE `+pgx.Identifier{dbName}.Sanitize()+` WITH (FORCE)`); err != nil {
+			t.Error(err)
+		}
+		if !workerRoleExists {
+			if _, err := admin.Exec(context.Background(), `DROP ROLE deletion_worker`); err != nil {
+				t.Error(err)
+			}
+		}
+	}()
 	ownerURL, err := url.Parse(adminURL)
 	if err != nil {
 		t.Fatal(err)
@@ -95,9 +106,20 @@ func TestIntegration(t *testing.T) {
 	if _, err = owner.Exec(ctx, string(schema)); err != nil {
 		t.Fatal(err)
 	}
+	outboxMigration, err := os.ReadFile("../../migrations/002_outbox_retention.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = owner.Exec(ctx, string(outboxMigration)); err != nil {
+		t.Fatal(err)
+	}
 	workerURL := *ownerURL
 	workerURL.User = url.UserPassword("deletion_worker", "integration-worker-password")
-	store := Store{URL: workerURL.String(), Salt: strings.Repeat("integration-salt", 3)}
+	store, err := NewStore(ctx, workerURL.String(), strings.Repeat("integration-salt", 3))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
 	if err = store.CheckPrivileges(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -221,6 +243,11 @@ func TestIntegration(t *testing.T) {
 		}
 		fake := &fakeS3{}
 		fake.delete = func(in *s3.DeleteObjectsInput) (*s3.DeleteObjectsOutput, error) {
+			probeCtx, cancel := context.WithTimeout(ctx, time.Second)
+			defer cancel()
+			if _, err := owner.Exec(probeCtx, `UPDATE users SET status=status WHERE id='partial-user'`); err != nil {
+				return nil, fmt.Errorf("S3 request held the user row lock: %w", err)
+			}
 			if aws.ToBool(in.Delete.Quiet) || len(in.Delete.Objects) != 3 {
 				t.Fatal("wrong deletion request")
 			}
@@ -356,6 +383,16 @@ func TestIntegration(t *testing.T) {
 		if err := svc.Flush(ctx); err != nil || len(queue.bodies) != before {
 			t.Fatal("sent messages replayed")
 		}
+		oldMessage := newUUID()
+		if _, err := owner.Exec(ctx, `INSERT INTO deletion_outbox(id,destination,payload,sent_at) VALUES($1,'db','{}',now()-interval '31 days')`, oldMessage); err != nil {
+			t.Fatal(err)
+		}
+		if err := svc.Flush(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if n := count(`SELECT count(*) FROM deletion_outbox WHERE id=$1`, oldMessage); n != 0 {
+			t.Fatal("expired sent outbox message was retained")
+		}
 		if err := store.Finalize(ctx, m); err != nil {
 			t.Fatal(err)
 		}
@@ -438,8 +475,11 @@ func TestIntegration(t *testing.T) {
 		if _, err := owner.Exec(ctx, `INSERT INTO object_storage(user_id,object_key) VALUES('chunk-user','late-key')`); err == nil {
 			t.Fatal("pending user accepted metadata")
 		}
-		unsafe := store
-		unsafe.URL = ownerURL.String()
+		unsafe, err := NewStore(ctx, ownerURL.String(), store.Salt)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer unsafe.Close()
 		if err := unsafe.CheckPrivileges(ctx); err == nil {
 			t.Fatal("accepted schema owner")
 		}
@@ -449,6 +489,9 @@ func TestIntegration(t *testing.T) {
 			t.Setenv("AWS_ACCESS_KEY_ID", "test")
 			t.Setenv("AWS_SECRET_ACCESS_KEY", "test")
 			t.Setenv("AWS_REGION", "us-east-1")
+			if _, err := owner.Exec(ctx, `DELETE FROM deletion_outbox`); err != nil {
+				t.Fatal(err)
+			}
 			cfg, err := config.LoadDefaultConfig(ctx)
 			if err != nil {
 				t.Fatal(err)
@@ -459,48 +502,110 @@ func TestIntegration(t *testing.T) {
 			if _, err := s3Client.CreateBucket(ctx, &s3.CreateBucketInput{Bucket: aws.String(name)}); err != nil {
 				t.Fatal(err)
 			}
-			defer s3Client.DeleteBucket(ctx, &s3.DeleteBucketInput{Bucket: aws.String(name)})
+			defer func() {
+				objects, err := s3Client.ListObjectsV2(context.Background(), &s3.ListObjectsV2Input{Bucket: aws.String(name)})
+				if err == nil && len(objects.Contents) > 0 {
+					keys := make([]s3types.ObjectIdentifier, 0, len(objects.Contents))
+					for _, object := range objects.Contents {
+						keys = append(keys, s3types.ObjectIdentifier{Key: object.Key})
+					}
+					_, err = s3Client.DeleteObjects(context.Background(), &s3.DeleteObjectsInput{
+						Bucket: aws.String(name), Delete: &s3types.Delete{Objects: keys},
+					})
+				}
+				if err != nil {
+					t.Errorf("clean up S3 test bucket objects: %v", err)
+				}
+				if _, err := s3Client.DeleteBucket(context.Background(), &s3.DeleteBucketInput{Bucket: aws.String(name)}); err != nil {
+					t.Errorf("delete S3 test bucket: %v", err)
+				}
+			}()
 			dbQ, err := queue.CreateQueue(ctx, &sqs.CreateQueueInput{QueueName: aws.String(name + "-db")})
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer queue.DeleteQueue(ctx, &sqs.DeleteQueueInput{QueueUrl: dbQ.QueueUrl})
+			defer func() {
+				if _, err := queue.DeleteQueue(context.Background(), &sqs.DeleteQueueInput{QueueUrl: dbQ.QueueUrl}); err != nil {
+					t.Errorf("delete DB test queue: %v", err)
+				}
+			}()
 			s3Q, err := queue.CreateQueue(ctx, &sqs.CreateQueueInput{QueueName: aws.String(name + "-s3")})
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer queue.DeleteQueue(ctx, &sqs.DeleteQueueInput{QueueUrl: s3Q.QueueUrl})
-			seed("real-user", 2)
+			defer func() {
+				if _, err := queue.DeleteQueue(context.Background(), &sqs.DeleteQueueInput{QueueUrl: s3Q.QueueUrl}); err != nil {
+					t.Errorf("delete S3 test queue: %v", err)
+				}
+			}()
+			userID := "real-user-" + newUUID()
+			seed(userID, 2)
 			for i := 1; i <= 2; i++ {
-				if _, err := s3Client.PutObject(ctx, &s3.PutObjectInput{Bucket: aws.String(name), Key: aws.String(fmt.Sprintf("real-user/%d", i)), Body: strings.NewReader("private")}); err != nil {
+				if _, err := s3Client.PutObject(ctx, &s3.PutObjectInput{Bucket: aws.String(name), Key: aws.String(fmt.Sprintf("%s/%d", userID, i)), Body: strings.NewReader("private")}); err != nil {
 					t.Fatal(err)
 				}
 			}
 			svc := Service{Store: store, S3: s3Client, Queue: queue, Bucket: name, DBQueue: aws.ToString(dbQ.QueueUrl), S3Queue: aws.ToString(s3Q.QueueUrl)}
-			m := Message{RequestID: newUUID(), UserID: "real-user"}
-			if err := store.Initiate(ctx, m); err != nil {
+			m := Message{Type: "INITIATE_DELETION", RequestID: newUUID(), UserID: userID}
+			body, err := json.Marshal(m)
+			if err != nil {
 				t.Fatal(err)
 			}
-			// Earlier cases intentionally leave messages pending; all are safe to publish.
-			if err := svc.Flush(ctx); err != nil {
+			if _, err := queue.SendMessage(ctx, &sqs.SendMessageInput{QueueUrl: dbQ.QueueUrl, MessageBody: aws.String(string(body))}); err != nil {
 				t.Fatal(err)
 			}
-			received, err := queue.ReceiveMessage(ctx, &sqs.ReceiveMessageInput{QueueUrl: s3Q.QueueUrl, MaxNumberOfMessages: 10})
-			if err != nil || len(received.Messages) == 0 {
-				t.Fatal("outbox did not reach SQS", err)
+			handleNext := func(queueURL, kind, expectedAction string) Message {
+				t.Helper()
+				received, err := queue.ReceiveMessage(ctx, &sqs.ReceiveMessageInput{
+					QueueUrl: aws.String(queueURL), MaxNumberOfMessages: 1, WaitTimeSeconds: 10,
+				})
+				if err != nil {
+					t.Fatalf("receive %s message: %v", kind, err)
+				}
+				if len(received.Messages) != 1 {
+					t.Fatalf("expected %s message %q, queue was empty", kind, expectedAction)
+				}
+				var message Message
+				if err := json.Unmarshal([]byte(aws.ToString(received.Messages[0].Body)), &message); err != nil {
+					t.Fatalf("decode %s message: %v", kind, err)
+				}
+				if message.Type != expectedAction {
+					t.Fatalf("got %s message %q, want %q", kind, message.Type, expectedAction)
+				}
+				if err := svc.Handle(ctx, kind, []byte(aws.ToString(received.Messages[0].Body))); err != nil {
+					t.Fatalf("handle %s message %q: %v", kind, expectedAction, err)
+				}
+				if _, err := queue.DeleteMessage(ctx, &sqs.DeleteMessageInput{
+					QueueUrl: aws.String(queueURL), ReceiptHandle: received.Messages[0].ReceiptHandle,
+				}); err != nil {
+					t.Fatalf("acknowledge %s message: %v", kind, err)
+				}
+				return message
 			}
-			if err := svc.Purge(ctx, Message{RequestID: m.RequestID, BatchID: batch(m.RequestID)}); err != nil {
-				t.Fatal(err)
+			initiated := handleNext(aws.ToString(dbQ.QueueUrl), "db", "INITIATE_DELETION")
+			if initiated.RequestID != m.RequestID {
+				t.Fatal("initiation queue message had wrong request ID")
 			}
-			if err := svc.Flush(ctx); err != nil {
-				t.Fatal(err)
+			purge := handleNext(aws.ToString(s3Q.QueueUrl), "s3", "PURGE_S3_BATCH")
+			if purge.RequestID != m.RequestID || !validUUID(purge.BatchID) {
+				t.Fatal("S3 queue message did not reference the initiated request and a persisted batch")
 			}
-			if err := store.Finalize(ctx, m); err != nil {
-				t.Fatal(err)
+			finalizer := handleNext(aws.ToString(dbQ.QueueUrl), "db", "FINALIZE_DB_DELETION")
+			if finalizer.RequestID != m.RequestID {
+				t.Fatal("finalizer queue message had wrong request ID")
 			}
 			objects, err := s3Client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{Bucket: aws.String(name)})
 			if err != nil || len(objects.Contents) != 0 {
 				t.Fatal("S3 objects remain", err)
+			}
+			if n := count(`SELECT count(*) FROM users WHERE id=$1`, userID); n != 0 {
+				t.Fatal("user remains after end-to-end queue processing")
+			}
+			if n := count(`SELECT count(*) FROM object_storage WHERE user_id=$1`, userID); n != 0 {
+				t.Fatal("object metadata remains after end-to-end queue processing")
+			}
+			if n := count(`SELECT count(*) FROM deletion_audit_log WHERE deletion_request_id=$1 AND stage IN ('INITIATED','BATCH_COMPLETED','COMPLETED')`, m.RequestID); n != 3 {
+				t.Fatalf("expected all three audit stages, got %d", n)
 			}
 			if _, err := s3Client.PutBucketVersioning(ctx, &s3.PutBucketVersioningInput{Bucket: aws.String(name), VersioningConfiguration: &s3types.VersioningConfiguration{Status: s3types.BucketVersioningStatusEnabled}}); err != nil {
 				t.Fatal(err)

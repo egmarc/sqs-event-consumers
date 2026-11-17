@@ -4,15 +4,16 @@ services:
   postgres:
     image: postgres:17-alpine
     environment:
-      POSTGRES_DB: deletion
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: local-only-owner
+      POSTGRES_DB: ${POSTGRES_DB:?Set POSTGRES_DB in .env}
+      POSTGRES_USER: ${POSTGRES_USER:?Set POSTGRES_USER in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      DELETION_WORKER_PASSWORD: ${DELETION_WORKER_PASSWORD:?Set DELETION_WORKER_PASSWORD in .env}
     volumes:
       - postgres-data:/var/lib/postgresql/data
       - ./migrations:/migrations:ro
       - ./local/postgres-init.sh:/docker-entrypoint-initdb.d/001-init.sh:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d deletion"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
       interval: 3s
       timeout: 3s
       retries: 30
@@ -21,9 +22,15 @@ services:
     image: localstack/localstack:4.14.0
     environment:
       SERVICES: sqs,s3
-      AWS_DEFAULT_REGION: us-east-1
+      AWS_DEFAULT_REGION: ${AWS_REGION:?Set AWS_REGION in .env}
+      AWS_REGION: ${AWS_REGION:?Set AWS_REGION in .env}
       LOCALSTACK_HOST: localstack:4566
       SQS_ENDPOINT_STRATEGY: path
+      DB_QUEUE_NAME: ${DB_QUEUE_NAME:?Set DB_QUEUE_NAME in .env}
+      DB_DLQ_NAME: ${DB_DLQ_NAME:?Set DB_DLQ_NAME in .env}
+      S3_QUEUE_NAME: ${S3_QUEUE_NAME:?Set S3_QUEUE_NAME in .env}
+      S3_DLQ_NAME: ${S3_DLQ_NAME:?Set S3_DLQ_NAME in .env}
+      S3_BUCKET: ${S3_BUCKET:?Set S3_BUCKET in .env}
     ports:
       - "127.0.0.1:4566:4566"
     volumes:
@@ -40,16 +47,15 @@ services:
       target: local
     environment: &worker-environment
       APP_MODE: local
-      DATABASE_URL: "host=postgres port=5432 dbname=deletion user=deletion_worker sslmode=disable"
-      PGPASSWORD: local-only-worker
-      AUDIT_SALT: local-development-only-salt-32-bytes-minimum
-      S3_BUCKET: deletion-objects
-      DB_QUEUE_URL: http://localstack:4566/queue/us-east-1/000000000000/db-deletion-queue
-      S3_QUEUE_URL: http://localstack:4566/queue/us-east-1/000000000000/s3-deletion-queue
+      DATABASE_URL: ${DATABASE_URL:?Set DATABASE_URL in .env}
+      AUDIT_SALT: ${AUDIT_SALT:?Set AUDIT_SALT in .env}
+      S3_BUCKET: ${S3_BUCKET:?Set S3_BUCKET in .env}
+      DB_QUEUE_URL: http://localstack:4566/queue/${AWS_REGION:?Set AWS_REGION in .env}/000000000000/${DB_QUEUE_NAME:?Set DB_QUEUE_NAME in .env}
+      S3_QUEUE_URL: http://localstack:4566/queue/${AWS_REGION:?Set AWS_REGION in .env}/000000000000/${S3_QUEUE_NAME:?Set S3_QUEUE_NAME in .env}
       AWS_ENDPOINT_URL: http://localstack:4566
-      AWS_REGION: us-east-1
-      AWS_ACCESS_KEY_ID: test
-      AWS_SECRET_ACCESS_KEY: test
+      AWS_REGION: ${AWS_REGION:?Set AWS_REGION in .env}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:?Set AWS_ACCESS_KEY_ID in .env}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:?Set AWS_SECRET_ACCESS_KEY in .env}
     depends_on:
       postgres:
         condition: service_healthy

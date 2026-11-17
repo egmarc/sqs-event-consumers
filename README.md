@@ -47,11 +47,14 @@ Adapt foreign keys and deletion order to your actual schema before deployment.
    `contact_methods → address → users`, clears transient identifying data, and
    appends `COMPLETED`. Replayed messages cannot certify an unfinished deletion.
 
-Outbox sending and marking are deliberately ordered send-before-mark; a crash
-can duplicate a message but cannot silently lose a committed dispatch. A
-one-minute DB-worker schedule replays unsent entries even after the inbound
-message reaches its DLQ. Local workers also replay periodically. Database locks
-serialize work for the same user; different users can progress concurrently.
+Outbox sending and marking are deliberately ordered send-before-mark, with AWS
+calls outside database transactions; a crash or concurrent flush can duplicate
+a message but cannot silently lose a committed dispatch. Consumers are
+idempotent. Sent outbox rows are pruned after 30 days. A one-minute DB-worker
+schedule replays unsent entries even after the inbound message reaches its DLQ.
+Local workers also replay periodically. Each worker process uses a PostgreSQL
+pool capped at two connections. Database locks serialize work for the same
+user; different users can progress concurrently.
 
 ### Compliance boundaries
 
@@ -85,9 +88,12 @@ serialize work for the same user; different users can progress concurrently.
 ## Run locally
 
 Requirements: Docker with Compose. Local credentials and audit salt below are
-deliberately public development values; never reuse them outside this stack.
+deliberately public development values in `.env.example`; copy that file to
+`.env` to start, and never reuse those values outside this stack. Compose reads
+`.env` automatically, and `.env` is ignored by Git.
 
 ```sh
+cp .env.example .env
 docker compose up --build -d
 docker compose ps
 docker compose logs db-worker s3-worker
@@ -153,7 +159,23 @@ sam validate --lint
 ```
 
 Go tests live beside their packages, not in separate top-level unit directories.
-Integration tests are opt-in:
+The fast default test run runs unit tests and skips the service-dependent
+integration test. CI runs both the default suite and the integration suite
+against disposable PostgreSQL and LocalStack services:
+
+```sh
+docker compose -f docker-compose.integration.yml up -d --wait postgres localstack
+TEST_DATABASE_URL="postgres://postgres:integration-owner@127.0.0.1:5432/postgres?sslmode=disable" \
+TEST_AWS_ENDPOINT_URL=http://127.0.0.1:4566 \
+AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test AWS_REGION=us-east-1 \
+go test -count=1 -run '^TestIntegration$' -v ./internal/worker
+docker compose -f docker-compose.integration.yml down --volumes --remove-orphans
+```
+
+The LocalStack round-trip test sends and consumes real SQS messages, runs each
+worker handler through initiation, S3 batch deletion, and database finalization,
+and verifies the PostgreSQL, audit-ledger, and S3 results. The service-dependent
+integration test is opt-in outside CI:
 
 ```sh
 TEST_DATABASE_URL="$DISPOSABLE_POSTGRES_ADMIN_URL" \
@@ -163,8 +185,10 @@ go test -count=1 -run TestIntegration -v ./internal/worker
 
 Use an isolated, **disposable PostgreSQL server** with an administrator URL:
 tests create/drop a temporary database and create a cluster-wide
-`deletion_worker` login with a fixed test password. Do not point them at your
-application or production cluster. Omit `TEST_AWS_ENDPOINT_URL` to test database
+`deletion_worker` login with a fixed test password if one does not already
+exist. A test-created role is dropped afterward; an existing role is left
+untouched and must accept that password. Do not point them at your application
+or production cluster. Omit `TEST_AWS_ENDPOINT_URL` to test database
 behavior with fake AWS clients only; set it to a disposable LocalStack endpoint
 to include real SQS/S3 round trips. Integration AWS resources use unique names.
 
@@ -182,12 +206,20 @@ to include real SQS/S3 round trips. Integration AWS resources use unique names.
 
 AWS credentials use the SDK default provider chain (execution roles in AWS).
 Do not put production credentials or salts in this repository.
+For local development, set Compose inputs in the ignored `.env` file; the
+committed `.env.example` contains disposable local-only defaults. For AWS,
+`template.yaml` maps protected SAM/CloudFormation parameters into Lambda
+environment variables; `DatabaseURL` and `AuditSalt` are `NoEcho`. Use separate
+secret values and deployment parameters for sandbox and production. Lambda
+environment variables are configured on the function, rather than in ECS task
+definitions.
 
 ## Deploy to AWS
 
 1. Provision PostgreSQL and a dedicated never-versioned bucket. Create a
    non-owner login named `deletion_worker` through your secret-management
-   process, **before** applying the SQL migration as a separate schema owner.
+   process, **before** applying `migrations/001_init.sql` and
+   `migrations/002_outbox_retention.sql` in order as a separate schema owner.
    The migration grants the runtime only its required table/sequence access.
    Never run workers as the migration owner.
 2. Build with `sam build` (Go 1.25+ and Make), then `sam deploy --guided`.

@@ -1,0 +1,39 @@
+name: sqs-event-consumers-integration
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: postgres
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: integration-owner
+    ports:
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  localstack:
+    image: localstack/localstack:4.14.0
+    environment:
+      SERVICES: sqs,s3
+      AWS_DEFAULT_REGION: us-east-1
+      AWS_REGION: us-east-1
+      LOCALSTACK_HOST: localhost:4566
+      SQS_ENDPOINT_STRATEGY: path
+      DB_QUEUE_NAME: db-deletion-queue
+      DB_DLQ_NAME: db-deletion-dlq
+      S3_QUEUE_NAME: s3-deletion-queue
+      S3_DLQ_NAME: s3-deletion-dlq
+      S3_BUCKET: deletion-integration-objects
+    ports:
+      - "127.0.0.1:4566:4566"
+    volumes:
+      - ./local/aws-init.sh:/etc/localstack/init/ready.d/001-init.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /tmp/deletion-ready"]
+      interval: 3s
+      timeout: 5s
+      retries: 40
