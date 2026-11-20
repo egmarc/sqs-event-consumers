@@ -1,144 +1,296 @@
 # SQS event consumers
 
-Go monorepo for two AWS Lambda consumers implementing a data-deletion workflow:
+Go monorepo with two SQS consumers and a scheduled recovery Lambda:
 
 ```text
-API → DB SQS → db-worker → transactional outbox → S3 SQS → s3-worker
-                  ↑                                      │
-                  └──────── finalization via DB SQS ──────┘
-                      PostgreSQL append-only audit ledger
+API -> DB SQS -> db-worker -> PostgreSQL outbox -> S3 SQS -> s3-worker
+                    ^                                         |
+                    +----------- finalization via DB SQS ------+
+                                  ^
+                 EventBridge Scheduler -> reconciler
 ```
 
-Both standard queues have independent dead-letter queues. PostgreSQL is the source
-of truth for request ownership, batches, progress, and dispatch. SQS delivery is
-at-least-once; effects and audit entries are idempotent, not “exactly once.”
+PostgreSQL owns workflow state and the append-only audit ledger. Each standard
+queue has its own DLQ. Delivery is at-least-once; database effects and audit
+events are idempotent. There is no distributed ACID transaction spanning
+PostgreSQL, SQS, and S3. Transactions atomically persist local effects and outgoing
+intent; an outbox and reconciliation recover interruptions.
 
 ## Layout
 
-- `cmd/db-worker`, `cmd/s3-worker`: Lambda entry points and local polling mode.
-- `internal/worker`: shared orchestration, PostgreSQL, AWS adapters, and colocated
-  Go unit/integration tests.
-- `migrations/001_init.sql`: example application tables, orchestration tables,
-  append-only `deletion_audit_log`, write guards, and restricted runtime grants.
-- `local`: development-only PostgreSQL/LocalStack initialization.
-- `Dockerfile`, `docker-compose.yml`: local workers, PostgreSQL, and LocalStack.
-- `template.yaml`: SAM deployment for Lambda, SQS/DLQs, replay schedule, and alarms.
+- `cmd/db-worker`: `INITIATE_DELETION` and `FINALIZE_DB_DELETION`.
+- `cmd/s3-worker`: `PURGE_S3_BATCH`.
+- `cmd/reconciler`: scheduled recovery, bounded dispatch, retention, health metrics.
+- `internal/worker`: shared contracts, validation, PostgreSQL, AWS, and tracing.
+- `migrations`: disposable example schema and runtime grants.
+- `template.yaml`: SAM zip deployments, scoped IAM, Scheduler, queues, and alarms.
+- `telemetry/collector.yaml`: ADOT Collector OTLP-to-X-Ray configuration.
+- `local`, Compose files, and `Dockerfile`: isolated local infrastructure.
 
-The application tables are an example, not a migration for an existing product.
-Adapt foreign keys and deletion order to your actual schema before deployment.
+This is an example application schema, not an upgrade migration for an existing
+product. These schema changes require recreating disposable local/test databases.
+Adapt foreign keys and deletion order before integrating an existing schema.
 
-## Workflow and safety
+## Workflow
 
-1. Send `INITIATE_DELETION` with a generated UUID `deletion_request_id` and
-   `user_id` to the DB queue. The worker locks the user, changes their status to
-   `PENDING_DELETION`, and records `INITIATED` with a salted SHA-256 identifier.
-2. In the same transaction, it snapshots `object_storage` into batches of at most
-   1,000 keys and writes dispatch records to an outbox. S3 messages reference
-   persisted batch IDs instead of carrying filenames. Workers never trust
-   caller-supplied keys or a caller-supplied bucket.
-3. The S3 worker loads the canonical batch and calls `DeleteObjects` with
-   `Quiet=false`. Only positively confirmed `Deleted` keys lose their metadata;
-   errors and missing confirmations cause a retry. Counts reflect distinct
-   metadata rows removed, including across partial retries.
-4. A completed batch records `BATCH_COMPLETED`. Serialized completion checks and
-   a durable finalizer flag enqueue one finalization once there are no objects
-   **and** no unfinished batches. A zero-file user takes this path immediately.
-5. Finalization checks readiness again, then atomically deletes
-   `contact_methods → address → users`, clears transient identifying data, and
-   appends `COMPLETED`. Replayed messages cannot certify an unfinished deletion.
+1. The authorized API sends `INITIATE_DELETION`. A transaction locks the user,
+   marks `user_profiles.status=PENDING_DELETION`, records the initiator and
+   `INITIATED` audit event, and snapshots **at most 500** objects into a persisted
+   batch and per-object items. Its outgoing command is written in the same
+   transaction. A user with no object metadata goes directly to finalization.
+2. Pagination uses immutable `object_id` keyset cursors and the
+   `(user_id, object_id)` index, never `OFFSET`. `object_metadata.object_key` is
+   generated from `prefix || filename`; `(bucket, object_key)` is unique.
+   The owning application chooses names, normally GUIDs plus extensions.
+3. Before deleting a batch, the S3 worker obtains a two-minute recoverable lease
+   and durably prepares at most the next 500-item page. Enumeration can continue
+   even when an earlier page has unresolved files. Duplicate cursor commands
+   cannot create duplicate pages. A message's `start_key` must match its
+   canonical stored batch; caller-supplied filenames and buckets are rejected.
+4. The worker validates each object and groups supported targets by bucket.
+   Each invocation handles at most ten bucket groups, with bounded AWS calls
+   and database checkpoints after each group. Successful checkpoints survive
+   later invocation failures. Unattempted groups receive a durable continuation
+   rather than consuming the SQS failure budget for normal bounded work.
+   Only explicit `Deleted` confirmations remove
+   metadata. An error overrides a contradictory confirmation; missing
+   confirmations and transport failures remain retryable.
+5. Invalid/unauthorized objects become durable `INVALID` items. Permanent S3
+   failures become `BLOCKED`; retryable per-item failures have five attempts.
+   Valid files continue, including files in other buckets/pages. Unresolved
+   items retain their snapshot and sanitized error code; they **never** count
+   as completed. Retries target only unfinished items.
+6. Finalization requires **enumeration complete, no unfinished/blocked batches,
+   and no remaining object metadata**. A null next cursor alone is not proof:
+   other batches may still be executing or failed.
+7. DB finalization removes at most 500 child rows per invocation, in
+   `contact_methods -> addresses` order. A durable generation number deduplicates
+   continuation messages. The final transaction deletes `user_profiles`, scrubs
+   the request's user ID, and atomically records `COMPLETED` and accumulated
+   relational deletion counts.
 
-Outbox sending and marking are deliberately ordered send-before-mark; a crash
-can duplicate a message but cannot silently lose a committed dispatch. A
-one-minute DB-worker schedule replays unsent entries even after the inbound
-message reaches its DLQ. Local workers also replay periodically. Database locks
-serialize work for the same user; different users can progress concurrently.
+Batch snapshots scrub bucket/key/name fields after confirmed deletion. Audit
+counts reflect distinct metadata rows actually removed, not retry attempts.
+Request ownership and initiator hashes must match on replays.
 
-### Compliance boundaries
+### Object identity and application responsibilities
 
-- The ledger contains request/batch UUIDs, a salted user-ID hash, stages, counts,
-  and timestamps—not names, emails, user IDs, or filenames. Completed
-  orchestration records also scrub raw identifiers and key snapshots.
-- Salted hashes are **pseudonymous**, not a blanket guarantee of legal
-  anonymization. Protect the salt, keep it stable across retries, and define a
-  reviewed retention and rotation policy. Queue messages/DLQs still contain the
-  initiating user ID; restrict access, avoid payload logging, and handle their
-  retention as personal data.
-- The runtime must connect as the non-owner `deletion_worker` role. Startup
-  rejects unsafe privileges. SQL triggers reject ledger updates, deletes, and
-  truncation. A database owner/superuser can still bypass these controls; use
-  separate administrator credentials and export to an immutable compliance
-  store (for example S3 Object Lock) if your threat model requires it.
-- Only **never-versioned S3 buckets** are supported. Workers fail closed for
-  enabled or suspended versioning: deleting a key is not proof that historical
-  versions were erased. Do not enable versioning during processing. Replicas,
-  Object Lock, backups, logs, caches, search indexes, and external systems need
-  separate deletion/retention policies; `COMPLETED` certifies only this schema
-  and configured bucket, not an organization's entire data footprint.
-- Setting user status is not itself session revocation. Your API/auth layer
-  must reject pending users, revoke sessions, and prevent uploads, including
-  previously issued upload URLs/in-flight writes. Database triggers prevent new
-  tracked relational/object metadata writes after initiation; they cannot stop
-  an independent S3 uploader. Quiesce uploads before beginning deletion.
-- Treat the queues as privileged commands: only a trusted, authorized producer
-  should be able to initiate deletion. UUIDs are idempotency keys, not auth.
+The deletion workers do not choose filenames, buckets, or prefixes. The
+application must allocate new physical keys for new uploads/ownership
+generations and must not overwrite previously allocated addresses.
+
+The schema makes ownership, object ID, bucket, prefix, and filename immutable.
+A database trigger atomically registers each allocated `(bucket, key)`
+fingerprint in `storage_object_identities`; the append-only registry outlives
+deleted metadata. Reusing the address is rejected even after deletion completes.
+This prevents a stale in-flight S3 delete from damaging a later tracked object.
+Moves/replacements require new storage identities, not updates to old locations.
+The registry stores SHA-256 fingerprints, not raw filenames, but fingerprints
+remain pseudonymous retention data, not a legal anonymization guarantee.
+
+Your uploader must enforce the same rule for S3 writes, including presigned
+URLs. Database constraints cannot stop an independent S3 uploader from
+overwriting an old key. Quiesce in-flight uploads before initiating deletion.
+
+The API/auth layer owns user-state transitions, session revocation, and
+preventing reactivation/new writes during deletion. These consumers do not
+implement that lifecycle. Existing database guards reject tracked child writes
+for pending users; workers also refuse to operate on an unexpectedly active
+user. A violated lifecycle contract blocks progress and requires investigation.
+
+### Authorized buckets and validation
+
+`ALLOWED_S3_BUCKETS` is a comma-separated allowlist. SAM derives both this value
+and bucket-scoped S3 IAM resources from the same `AllowedBuckets` parameter.
+DB and reconciler roles do not need S3 access. A valid-looking bucket name in
+metadata does not authorize deletion.
+
+Typed `Message`, `Object`, and `Settings` contracts have explicit `Validate`
+methods. Validation includes action-specific fields, UUIDs, initiator hash,
+W3C trace context, bucket naming/authorization, nonempty keys up to 1,024 UTF-8
+bytes, XML-compatible characters, and prefix/filename consistency. Keys are not
+URL-decoded or path-normalized. No GUID filename policy is imposed by consumers.
+An empty prefix supports a root-level object.
+
+Only **never-versioned general-purpose S3 buckets** are supported. Each targeted
+bucket is checked before deletion; enabled or suspended versioning fails closed
+for its files without stopping other buckets. Do not enable versioning while
+processing. Historical versions, Object Lock, replicas, backups, logs, caches,
+search indexes, and external services need separate policies. `COMPLETED`
+certifies only the tracked schema and supported authorized storage targets.
+
+## Message envelope and tracing
+
+Legacy messages without the full envelope are rejected. `action`, not `type`,
+is the command discriminator. Unknown fields and trailing JSON are rejected.
+
+```json
+{
+  "version": 1,
+  "message_id": "bc8d9832-7b6f-4f3e-b723-ce29d63b2c85",
+  "action": "INITIATE_DELETION",
+  "deletion_request_id": "9ccb8491-74ed-4bd0-8ca0-4d462c3733ac",
+  "user_id": "demo-user",
+  "initiator_user_hash": "<64 lowercase hexadecimal characters>",
+  "traceparent": "<API producer's W3C version-00 traceparent>",
+  "tracestate": ""
+}
+```
+
+The API must derive the initiator hash from the authenticated actor, not trust
+an arbitrary hash supplied by its caller. Use a reviewed, stable pseudonymization
+scheme. The actor is distinct from the user being deleted. Queues are privileged
+commands; only trusted producers should have permission to publish. UUIDs and
+hashes are not authentication.
+
+Internal purge messages omit `user_id` and include persisted `batch_id` and a
+nonnegative `start_key` (zero for the first page). Finalizer messages instead
+carry a positive `generation`. The initiator hash is preserved across every
+dispatch and included in all audit events.
+
+OpenTelemetry extracts W3C context from the envelope, creates a fresh consumer
+span per attempt, and creates a fresh producer span on each actual SQS
+publication. The outgoing `traceparent` carries that producer span ID; it
+implicitly supplies the next consumer's parent. A separate `parent_span_id`
+field would duplicate W3C information and is not needed. Trace and initiator
+context persist in the outbox so delayed publication and reconciliation preserve
+the business trace. Request IDs remain the idempotency keys, not trace/span IDs.
+
+AWS zip deployments export OTLP/HTTP to a regional ADOT Collector Lambda
+extension, which exports to X-Ray. SAM requires a compatible x86_64
+`ADOTCollectorLayerARN`, packages `collector.yaml`, and configures
+`OPENTELEMETRY_COLLECTOR_CONFIG_URI`. Each invocation flushes application spans
+with a bounded cleanup deadline. VPC egress/endpoints must permit X-Ray export.
+Local Compose generates/propagates span IDs but disables export.
+
+Logs are structured JSON with request/message/batch IDs, trace/span IDs,
+initiator hash, attempts, counts, age, and sanitized error codes. They do not
+log message payloads, user IDs, original filenames, or S3 keys. Operational
+traces can be sampled and must not substitute for the durable audit ledger.
+
+## Dispatch, reconciliation, and operations
+
+The outbox publishes **before** marking sent. A crash in between can duplicate
+a command but cannot silently lose its committed intent. Short
+`FOR UPDATE SKIP LOCKED` claims use one-minute leases; AWS calls happen outside
+transactions. Every flush handles at most ten commands per destination and ten
+seconds total, with per-send deadlines and exponential backoff plus jitter.
+Expired claims are recoverable and a failed destination does not block the
+other queue. Committed work is acknowledged even if an unrelated dispatch
+fails: that failure is logged and scheduled maintenance retries it.
+
+EventBridge Scheduler invokes `reconciler` every minute. It considers at most
+25 stale requests and 20 stale batches per request per run. It distinguishes:
+
+| State | Durable evidence |
+| --- | --- |
+| Published | Outbox `sent_at` |
+| S3 operation completed | Batch `state=COMPLETED`, confirmed per-file outcomes |
+| Deletion completed | Request `state=COMPLETED` and append-only completion event |
+
+After a 15-minute inactivity window, reconciliation can republish unfinished
+business commands even when their previous messages were sent or reached a DLQ.
+It respects processing leases and existing unsent dispatches. Recovery is
+transactionally deduplicated and capped at five no-progress recoveries; it does
+not indefinitely redrive bad work. Confirmed progress resets recovery budgets.
+A finalizer's boolean "already queued" flag is not used as permanent evidence
+that the business operation ran.
+
+Maintenance removes at most 500 sent outbox rows older than 30 days using a
+partial retention index. It does not prune unfinished work, identity history,
+or compliance evidence. CloudWatch alarms cover DLQs, reconciler failures,
+unresolved work, outbox age, pending-request age, and a missing reconciler
+heartbeat. Embedded health metrics
+and alarms are scoped to the CloudFormation stack. Configure an SNS topic with
+confirmed responders and tune `PendingAgeAlarmSeconds` to your deletion SLO.
+
+Investigate `deletion_batch_items.state IN ('INVALID','BLOCKED')` and
+`error_code`, the associated request/batch, both DLQs, and trace-correlated logs.
+Correct authorization/configuration or perform reviewed storage remediation.
+An authorized administrator can return corrected items and batches to
+`PENDING` and schedule reconciliation; immutable identities cannot be redirected.
+Do not mark unresolved items `DELETED` merely to advance the workflow.
+Administrative exceptions require separately reviewed audit evidence. There is
+deliberately no generic "skip errors and declare success" command.
+
+The append-only ledger records subject/initiator pseudonyms, stages, counts,
+trace IDs, and timestamps, not raw identifying data. Startup requires the
+non-owner `deletion_worker` role and rejects unsafe privileges. Owners and
+superusers can still bypass database controls; separate administrator access
+and export to immutable compliance storage if required. This provides evidence
+for a reviewed control, not automatic SOC 2 certification. Queue/DLQ initiation
+messages still contain user IDs: restrict access and govern their retention.
 
 ## Run locally
 
-Requirements: Docker with Compose. Local credentials and audit salt below are
-deliberately public development values; never reuse them outside this stack.
+Requires Docker with Compose. Copy the disposable development settings:
 
 ```sh
+cp .env.example .env
 docker compose up --build -d
 docker compose ps
-docker compose logs db-worker s3-worker
+docker compose logs db-worker s3-worker reconciler
 ```
 
-PostgreSQL and AWS resources initialize automatically on first startup.
-Workers run as a non-root user and poll their respective queues. LocalStack is
-bound only to `127.0.0.1:4566`; PostgreSQL is not exposed to the host.
+For an existing local setup, these disposable schema changes require recreating
+its PostgreSQL volume. `docker compose down -v` **destroys this stack's local
+data**; run it deliberately, not against shared infrastructure. Initialization
+scripts do not migrate an existing volume. `.env` is ignored and must never
+contain values reused in production. Existing local `.env` files may use
+`S3_BUCKET` as a Compose-only fallback; new setups should set
+`ALLOWED_S3_BUCKETS`. `S3_BUCKET` in the example identifies its demonstration
+bucket, not a worker target override.
 
-Seed a synthetic user, relational data, and one object:
+Seed synthetic data using the updated schema:
 
 ```sh
 docker compose exec -T postgres psql -U postgres -d deletion <<'SQL'
-INSERT INTO users(id) VALUES ('demo-user');
-INSERT INTO address(user_id, address) VALUES ('demo-user', 'synthetic address');
-INSERT INTO contact_methods(user_id, value) VALUES ('demo-user', 'synthetic contact');
-INSERT INTO object_storage(user_id, object_key) VALUES ('demo-user', 'demo/file.txt');
+INSERT INTO user_profiles(id) VALUES ('demo-user');
+INSERT INTO addresses(user_id,address_line_1,city,state,zip_code)
+VALUES ('demo-user','synthetic address','city','state','code');
+INSERT INTO contact_methods(user_id,value) VALUES ('demo-user','synthetic contact');
+INSERT INTO object_metadata(user_id,bucket,prefix,filename,original_filename,content_type,size)
+VALUES ('demo-user','deletion-objects','demo/',
+        '11111111-1111-4111-8111-111111111111.jpg','beach.jpg','image/jpeg',9);
 SQL
 docker compose exec -T localstack sh -c 'printf synthetic >/tmp/demo-object'
 docker compose exec -T localstack awslocal s3api put-object \
-  --bucket deletion-objects --key demo/file.txt --body /tmp/demo-object
+  --bucket deletion-objects --key demo/11111111-1111-4111-8111-111111111111.jpg \
+  --body /tmp/demo-object
 ```
 
-Initiate deletion (use a new UUID for each new request):
+Use a fresh GUID when reseeding; retired storage addresses cannot be reused.
+
+Send a **local-only synthetic** API envelope with fresh tracing identifiers:
 
 ```sh
-docker compose exec -T localstack awslocal sqs send-message \
-  --queue-url http://localstack:4566/queue/us-east-1/000000000000/db-deletion-queue \
-  --message-body '{"action":"INITIATE_DELETION","deletion_request_id":"9ccb8491-74ed-4bd0-8ca0-4d462c3733ac","user_id":"demo-user"}'
+docker compose exec -T localstack python - <<'PY'
+import hashlib, json, os, secrets, time, uuid
+import boto3
+client = boto3.client("sqs", endpoint_url="http://localhost:4566",
+                      region_name=os.environ["AWS_REGION"],
+                      aws_access_key_id="test", aws_secret_access_key="test")
+queue = client.get_queue_url(QueueName=os.environ["DB_QUEUE_NAME"])["QueueUrl"]
+trace_id = int(time.time()).to_bytes(4, "big").hex() + secrets.token_hex(12)
+message = {
+    "version": 1, "message_id": str(uuid.uuid4()), "action": "INITIATE_DELETION",
+    "deletion_request_id": str(uuid.uuid4()), "user_id": "demo-user",
+    "initiator_user_hash": hashlib.sha256(b"local-only-demo-actor").hexdigest(),
+    "traceparent": f"00-{trace_id}-{secrets.token_hex(8)}-01"
+}
+client.send_message(QueueUrl=queue, MessageBody=json.dumps(message))
+PY
 ```
 
-After processing, inspect proof without selecting identifying application data:
+Inspect audit stages and request/batch/item states; queue acknowledgement alone
+is not deletion proof:
 
 ```sh
 docker compose exec -T postgres psql -U postgres -d deletion \
-  -c "SELECT deletion_request_id, user_id_hash, stage, items_affected, created_at FROM deletion_audit_log ORDER BY created_at;"
+  -c "SELECT deletion_request_id,initiator_user_hash,stage,items_affected FROM deletion_audit_log ORDER BY created_at;"
 docker compose exec -T postgres psql -U postgres -d deletion \
-  -c "SELECT EXISTS(SELECT 1 FROM users WHERE id='demo-user') AS user_remains;"
-docker compose exec -T localstack awslocal s3api list-objects-v2 --bucket deletion-objects
+  -c "SELECT request_id,state,enumeration_complete FROM deletion_requests;"
 ```
-
-Resending the same initiation is safe. For a zero-file example, seed another user
-without object metadata and send a different request UUID. Inspect both DLQs
-when processing fails; do not treat queue acknowledgement as deletion proof.
-
-```sh
-docker compose down -v
-```
-
-This destroys local data. Run it when resetting the example schema; initialization
-scripts do not migrate an existing PostgreSQL volume.
 
 ## Development
 
@@ -152,63 +304,79 @@ make build
 sam validate --lint
 ```
 
-Go tests live beside their packages, not in separate top-level unit directories.
-Integration tests are opt-in:
+The default test suite does not require services. Integration subtests create
+independent temporary databases and cover 500-item boundaries, bucket grouping,
+immutable identities, expired-worker races, invalid files, partial confirmations,
+bounded finalization, outbox claims/backoff, recovery, audit restrictions, W3C
+parentage, and Lambda partial responses. Fault-injection tests verify rollback
+across every workflow table, including deferred commit failures, S3 checkpoint
+failures, completion-audit failures, and lost finalizer continuations. Error
+cases assert retained metadata, item states and sanitized codes, attempt counts,
+leases, retry schedules, and the absence of false completion evidence.
+Additional cases cover malformed envelopes, UTF-8 key-size boundaries, mixed
+permanent/transient failures, interleaved users, stale generations, concurrent
+replays, and publication failures after a business commit.
+
+The optional LocalStack test exercises both actual queues through the Lambda
+SQS adapter, idempotent deletion of already-absent keys, and durable unresolved
+evidence for a missing bucket.
 
 ```sh
+docker compose -f docker-compose.integration.yml up -d --wait postgres localstack
 TEST_DATABASE_URL="$DISPOSABLE_POSTGRES_ADMIN_URL" \
-TEST_AWS_ENDPOINT_URL=http://localhost:4566 \
-go test -count=1 -run TestIntegration -v ./internal/worker
+TEST_AWS_ENDPOINT_URL=http://127.0.0.1:4566 \
+AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test AWS_REGION=us-east-1 \
+go test -race -count=1 -run '^TestIntegration$' -v ./internal/worker
+docker compose -f docker-compose.integration.yml down --volumes --remove-orphans
 ```
 
-Use an isolated, **disposable PostgreSQL server** with an administrator URL:
-tests create/drop a temporary database and create a cluster-wide
-`deletion_worker` login with a fixed test password. Do not point them at your
-application or production cluster. Omit `TEST_AWS_ENDPOINT_URL` to test database
-behavior with fake AWS clients only; set it to a disposable LocalStack endpoint
-to include real SQS/S3 round trips. Integration AWS resources use unique names.
+Use an isolated **disposable PostgreSQL server**. Tests create/drop databases and,
+if absent, a cluster-wide `deletion_worker` login with a fixed test password.
+A pre-existing role must accept the test password and is left untouched.
+Never use an application/production cluster. Omit `TEST_AWS_ENDPOINT_URL` to
+exercise PostgreSQL with fake AWS clients only.
 
-### Configuration
+### Configuration and deployment
 
-| Variable | Purpose |
+| Setting | Purpose |
 | --- | --- |
-| `DATABASE_URL` | PostgreSQL URI or pgx connection string for `deletion_worker`; require TLS in production |
-| `AUDIT_SALT` | Stable secret, at least 32 bytes, used for SHA-256 user pseudonyms |
-| `S3_BUCKET` | One trusted, never-versioned bucket |
+| `DATABASE_URL` | Restricted PostgreSQL connection; require TLS in production |
+| `AUDIT_SALT` | Stable secret of at least 32 bytes for subject pseudonyms |
+| `ALLOWED_S3_BUCKETS` | Authorized, never-versioned bucket names |
 | `DB_QUEUE_URL`, `S3_QUEUE_URL` | Respective queue URLs |
-| `AWS_REGION` | AWS SDK region |
-| `APP_MODE` | `local` for polling; unset or `lambda` for Lambda runtime |
-| `AWS_ENDPOINT_URL` | LocalStack endpoint; leave unset in AWS |
+| `AWS_REGION` | AWS SDK and ADOT region |
+| `APP_MODE` | `local` for polling; unset or `lambda` for Lambda |
+| `AWS_ENDPOINT_URL` | LocalStack only; rejected outside local mode |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | Local collector endpoint in SAM; explicit collector endpoint for other deployments |
+| `OTEL_SDK_DISABLED` | `true` disables export/sampling, not trace-context propagation |
+| `WORKFLOW_NAME` | Stack name for deployment-scoped health metrics |
 
-AWS credentials use the SDK default provider chain (execution roles in AWS).
-Do not put production credentials or salts in this repository.
+Provision PostgreSQL and authorized buckets separately. Create the non-owner
+`deletion_worker` login through your secret-management process **before** applying
+both migrations as a separate schema owner. Keep the audit salt stable and
+define reviewed retention/rotation policies.
 
-## Deploy to AWS
+Build using `sam build`, then `sam deploy --guided`. Supply `AllowedBuckets`,
+a regional compatible `ADOTCollectorLayerARN`, private subnet/security-group
+IDs, database credentials, audit salt, and the alarm SNS topic. Database URL and
+salt are `NoEcho`; do not commit them in deployment configuration or shell
+history. Use the official [ADOT Go Lambda documentation](https://aws-otel.github.io/docs/getting-started/lambda/lambda-go/)
+to select a regional collector extension with the `awsxray` exporter. Private
+networking needs PostgreSQL access plus SQS/S3/X-Ray egress or appropriate
+endpoints. Grant the trusted API producer send access only to the DB queue.
 
-1. Provision PostgreSQL and a dedicated never-versioned bucket. Create a
-   non-owner login named `deletion_worker` through your secret-management
-   process, **before** applying the SQL migration as a separate schema owner.
-   The migration grants the runtime only its required table/sequence access.
-   Never run workers as the migration owner.
-2. Build with `sam build` (Go 1.25+ and Make), then `sam deploy --guided`.
-   Supply the restricted database connection string and secret salt through a
-   protected deployment process. Both parameters are `NoEcho`; avoid shell
-   history and committing `samconfig.toml` containing secrets.
-3. Supply private subnet/security-group IDs with database access and NAT or
-   appropriate SQS/S3 endpoints. Keep PostgreSQL private and require TLS.
-4. Supply `AlarmTopicARN` for an existing SNS topic with confirmed
-   on-call/compliance subscriptions; both DLQ alarms publish to it. Verify the
-   topic policy permits CloudWatch alarm delivery. Grant your trusted API
-   producer permission to send only to the DB queue. Monitor outbox age and
-   pending requests as well as Lambda failures and DLQ depth.
+Functions time out after 60 seconds with 512 MB memory. Database initialization
+and safety checks share a 30-second startup deadline; rollback, acknowledgements,
+telemetry flush, and shutdown have bounded cleanup contexts. Each process caps
+its database pool at two connections. DB SQS concurrency is 2 (reserved 5), S3
+SQS concurrency is 50 (reserved 75), and reconciler reserved concurrency is 1.
+Queues use 360-second visibility, five receives before redrive, one-day source
+retention, fourteen-day DLQ retention, and partial batch responses. Physical AWS
+queue names are generated by CloudFormation; consume the stack queue URL outputs.
+Measure throughput and database/collector capacity before changing these limits.
 
-The SAM template sets DB reserved concurrency to 5 (SQS maximum 2, leaving
-capacity for replay) and S3 reserved concurrency to 75 (SQS maximum 50).
-Both functions time out after 60 seconds; queues have 360-second visibility,
-partial batch failure responses, five attempts before redrive, one-day source
-retention, and fourteen-day DLQ retention. Tune these limits and database
-capacity with measured load; this starter does not promise a particular deletion
-throughput or certify legal compliance.
-
-Optional container deployment targets are `db-lambda` and `s3-lambda` in the
-Dockerfile; Compose uses its `local` target.
+Docker targets `db-lambda`, `s3-lambda`, and `reconciler-lambda` build optional
+custom-runtime images. The SAM zip deployment includes the ADOT layer; these
+standalone images do not. For image deployments supply a collector endpoint or
+package a compatible collector extension yourself. Compose uses the non-root
+`local` target and disables span export.
