@@ -20,9 +20,18 @@ jobs:
           go-version: "1.25.x"
           cache: true
       - name: Run unit and default tests
-        run: go test ./...
+        run: go test -race ./...
+      - name: Check Go formatting
+        run: test -z "$(gofmt -l cmd internal)"
       - name: Run Go vet
         run: go vet ./...
+      - uses: aws-actions/setup-sam@v2
+        with:
+          use-installer: true
+      - name: Validate SAM template
+        run: sam validate --lint --region us-east-1
+      - name: Build Lambda artifacts
+        run: sam build
       - name: Start integration dependencies
         run: docker compose -f docker-compose.integration.yml up -d --wait postgres localstack
       - name: Run PostgreSQL and LocalStack integration tests
@@ -32,7 +41,7 @@ jobs:
           AWS_ACCESS_KEY_ID: test
           AWS_SECRET_ACCESS_KEY: test
           AWS_REGION: us-east-1
-        run: go test -count=1 -run '^TestIntegration$' -v ./internal/worker
+        run: go test -race -count=1 -run '^TestIntegration$' -v ./internal/worker
       - name: Stop integration dependencies
         if: always()
         run: docker compose -f docker-compose.integration.yml down --volumes --remove-orphans

@@ -1,5 +1,15 @@
 package main
 
-import "github.com/egmarc/sqs-event-consumers/internal/worker"
+import (
+	"log"
+	"os"
 
-func main() { worker.Run("s3") }
+	"github.com/egmarc/sqs-event-consumers/internal/worker"
+)
+
+func main() {
+	if err := worker.Run("s3"); err != nil {
+		log.Print(err)
+		os.Exit(1)
+	}
+}

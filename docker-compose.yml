@@ -30,7 +30,7 @@ services:
       DB_DLQ_NAME: ${DB_DLQ_NAME:?Set DB_DLQ_NAME in .env}
       S3_QUEUE_NAME: ${S3_QUEUE_NAME:?Set S3_QUEUE_NAME in .env}
       S3_DLQ_NAME: ${S3_DLQ_NAME:?Set S3_DLQ_NAME in .env}
-      S3_BUCKET: ${S3_BUCKET:?Set S3_BUCKET in .env}
+      ALLOWED_S3_BUCKETS: ${ALLOWED_S3_BUCKETS:-${S3_BUCKET:?Set ALLOWED_S3_BUCKETS in .env}}
     ports:
       - "127.0.0.1:4566:4566"
     volumes:
@@ -49,7 +49,8 @@ services:
       APP_MODE: local
       DATABASE_URL: ${DATABASE_URL:?Set DATABASE_URL in .env}
       AUDIT_SALT: ${AUDIT_SALT:?Set AUDIT_SALT in .env}
-      S3_BUCKET: ${S3_BUCKET:?Set S3_BUCKET in .env}
+      ALLOWED_S3_BUCKETS: ${ALLOWED_S3_BUCKETS:-${S3_BUCKET:?Set ALLOWED_S3_BUCKETS in .env}}
+      OTEL_SDK_DISABLED: "true"
       DB_QUEUE_URL: http://localstack:4566/queue/${AWS_REGION:?Set AWS_REGION in .env}/000000000000/${DB_QUEUE_NAME:?Set DB_QUEUE_NAME in .env}
       S3_QUEUE_URL: http://localstack:4566/queue/${AWS_REGION:?Set AWS_REGION in .env}/000000000000/${S3_QUEUE_NAME:?Set S3_QUEUE_NAME in .env}
       AWS_ENDPOINT_URL: http://localstack:4566
@@ -68,6 +69,19 @@ services:
       context: .
       target: local
     entrypoint: ["/app/s3-worker"]
+    environment: *worker-environment
+    depends_on:
+      postgres:
+        condition: service_healthy
+      localstack:
+        condition: service_healthy
+    restart: on-failure
+
+  reconciler:
+    build:
+      context: .
+      target: local
+    entrypoint: ["/app/reconciler"]
     environment: *worker-environment
     depends_on:
       postgres:

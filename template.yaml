@@ -1,6 +1,6 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Transform: AWS::Serverless-2016-10-31
-Description: SQS-driven data deletion workers with an external PostgreSQL ledger.
+Description: Paged deletion workers and scheduled recovery with an external PostgreSQL ledger.
 
 Parameters:
   DatabaseURL:
@@ -12,9 +12,18 @@ Parameters:
     NoEcho: true
     MinLength: 32
     Description: Stable secret salt from your secret manager. Do not rotate mid-request.
-  ObjectsBucket:
+  AllowedBuckets:
+    Type: CommaDelimitedList
+    Description: Authorized existing never-versioned bucket names; also scopes the S3 worker IAM policy.
+    AllowedPattern: "[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]"
+  ADOTCollectorLayerARN:
     Type: String
-    Description: Existing dedicated unversioned S3 bucket (no Object Lock).
+    Description: Regional x86_64 ADOT Collector Lambda extension layer ARN supporting provided.al2023 and awsxray.
+  PendingAgeAlarmSeconds:
+    Type: Number
+    Default: 3600
+    MinValue: 900
+    Description: Maximum expected age of a pending deletion before alerting.
   AlarmTopicARN:
     Type: String
     Description: Existing SNS topic with confirmed on-call/compliance subscriptions.
@@ -31,14 +40,21 @@ Globals:
     Handler: bootstrap
     Architectures: [x86_64]
     Timeout: 60
-    MemorySize: 256
+    MemorySize: 512
+    Tracing: Active
+    Layers: [!Ref ADOTCollectorLayerARN]
     Environment:
       Variables:
         DATABASE_URL: !Ref DatabaseURL
         AUDIT_SALT: !Ref AuditSalt
-        S3_BUCKET: !Ref ObjectsBucket
+        ALLOWED_S3_BUCKETS: !Join [",", !Ref AllowedBuckets]
         DB_QUEUE_URL: !Ref DBDeletionQueue
         S3_QUEUE_URL: !Ref S3DeletionQueue
+        WORKFLOW_NAME: !Ref AWS::StackName
+        OTEL_EXPORTER_OTLP_ENDPOINT: http://localhost:4318
+        OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+        OTEL_BSP_SCHEDULE_DELAY: "500"
+        OPENTELEMETRY_COLLECTOR_CONFIG_URI: /var/task/collector.yaml
     VpcConfig:
       SubnetIds: !Ref VpcSubnetIds
       SecurityGroupIds: !Ref VpcSecurityGroupIds
@@ -80,14 +96,11 @@ Resources:
       CodeUri: .
       ReservedConcurrentExecutions: 5
       Policies:
+        - AWSXRayDaemonWriteAccess
         - SQSSendMessagePolicy:
             QueueName: !GetAtt DBDeletionQueue.QueueName
         - SQSSendMessagePolicy:
             QueueName: !GetAtt S3DeletionQueue.QueueName
-        - Statement:
-            - Effect: Allow
-              Action: s3:GetBucketVersioning
-              Resource: !Sub arn:${AWS::Partition}:s3:::${ObjectsBucket}
       Events:
         Messages:
           Type: SQS
@@ -97,11 +110,6 @@ Resources:
             FunctionResponseTypes: [ReportBatchItemFailures]
             ScalingConfig:
               MaximumConcurrency: 2
-        ReplayOutbox:
-          Type: Schedule
-          Properties:
-            Schedule: rate(1 minute)
-            Input: '{"action":"FLUSH_OUTBOX"}'
   S3Worker:
     Type: AWS::Serverless::Function
     Metadata:
@@ -110,6 +118,7 @@ Resources:
       CodeUri: .
       ReservedConcurrentExecutions: 75
       Policies:
+        - AWSXRayDaemonWriteAccess
         - SQSSendMessagePolicy:
             QueueName: !GetAtt DBDeletionQueue.QueueName
         - SQSSendMessagePolicy:
@@ -117,10 +126,22 @@ Resources:
         - Statement:
             - Effect: Allow
               Action: s3:GetBucketVersioning
-              Resource: !Sub arn:${AWS::Partition}:s3:::${ObjectsBucket}
+              Resource: !Split
+                - ","
+                - !Sub
+                  - "arn:${AWS::Partition}:s3:::${Names}"
+                  - Names: !Join
+                      - !Sub ",arn:${AWS::Partition}:s3:::"
+                      - !Ref AllowedBuckets
             - Effect: Allow
               Action: s3:DeleteObject
-              Resource: !Sub arn:${AWS::Partition}:s3:::${ObjectsBucket}/*
+              Resource: !Split
+                - ","
+                - !Sub
+                  - "arn:${AWS::Partition}:s3:::${Names}/*"
+                  - Names: !Join
+                      - !Sub "/*,arn:${AWS::Partition}:s3:::"
+                      - !Ref AllowedBuckets
       Events:
         Messages:
           Type: SQS
@@ -130,6 +151,30 @@ Resources:
             FunctionResponseTypes: [ReportBatchItemFailures]
             ScalingConfig:
               MaximumConcurrency: 50
+  Reconciler:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: makefile
+    Properties:
+      CodeUri: .
+      ReservedConcurrentExecutions: 1
+      Policies:
+        - AWSXRayDaemonWriteAccess
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt DBDeletionQueue.QueueName
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt S3DeletionQueue.QueueName
+      Events:
+        Recovery:
+          Type: ScheduleV2
+          Properties:
+            ScheduleExpression: rate(1 minute)
+            FlexibleTimeWindow:
+              Mode: "OFF"
+            Input: '{"action":"RECONCILE"}'
+            RetryPolicy:
+              MaximumRetryAttempts: 2
+              MaximumEventAgeInSeconds: 120
   DBWorkerLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
@@ -140,6 +185,111 @@ Resources:
     Properties:
       LogGroupName: !Sub /aws/lambda/${S3Worker}
       RetentionInDays: 14
+  ReconcilerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${Reconciler}
+      RetentionInDays: 14
+  UnresolvedItemsMetric:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref S3WorkerLogGroup
+      FilterPattern: '{ $.event = "item_unresolved" && ($.state = "INVALID" || $.state = "BLOCKED") }'
+      MetricTransformations:
+        - MetricNamespace: DeletionWorkflow
+          MetricName: UnresolvedWork
+          MetricValue: "1"
+          Dimensions:
+            - Key: Workflow
+              Value: $.workflow
+  BlockedRequestsMetric:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref ReconcilerLogGroup
+      FilterPattern: '{ $.event = "request_blocked" }'
+      MetricTransformations:
+        - MetricNamespace: DeletionWorkflow
+          MetricName: UnresolvedWork
+          MetricValue: "1"
+          Dimensions:
+            - Key: Workflow
+              Value: $.workflow
+  UnresolvedWorkAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      Namespace: DeletionWorkflow
+      MetricName: UnresolvedWork
+      Dimensions:
+        - Name: Workflow
+          Value: !Ref AWS::StackName
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopicARN]
+  ReconcilerErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref Reconciler
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopicARN]
+  PendingAgeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      Namespace: DeletionWorkflow
+      MetricName: OldestPendingAgeSeconds
+      Dimensions:
+        - Name: Workflow
+          Value: !Ref AWS::StackName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: !Ref PendingAgeAlarmSeconds
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopicARN]
+  ReconcilerHeartbeatAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Scheduled recovery has not run; workflow health metrics may be stale.
+      Namespace: AWS/Lambda
+      MetricName: Invocations
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref Reconciler
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: breaching
+      AlarmActions: [!Ref AlarmTopicARN]
+  OutboxAgeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      Namespace: DeletionWorkflow
+      MetricName: OldestUnsentAgeSeconds
+      Dimensions:
+        - Name: Workflow
+          Value: !Ref AWS::StackName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 900
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopicARN]
   DBDeadLetterAlarm:
     Type: AWS::CloudWatch::Alarm
     Properties:

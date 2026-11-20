@@ -14,5 +14,12 @@ create_queue_pair() {
 
 create_queue_pair "$DB_QUEUE_NAME" "$DB_DLQ_NAME"
 create_queue_pair "$S3_QUEUE_NAME" "$S3_DLQ_NAME"
-awslocal s3api create-bucket --bucket "$S3_BUCKET"
+printf '%s\n' "$ALLOWED_S3_BUCKETS" | tr ',' '\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | while IFS= read -r bucket; do
+  [ -n "$bucket" ] || continue
+  if [ "$AWS_REGION" = us-east-1 ]; then
+    awslocal s3api create-bucket --bucket "$bucket"
+  else
+    awslocal s3api create-bucket --bucket "$bucket" --create-bucket-configuration "LocationConstraint=$AWS_REGION"
+  fi
+done
 touch /tmp/deletion-ready
